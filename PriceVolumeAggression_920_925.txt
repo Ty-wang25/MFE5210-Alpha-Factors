@@ -1,0 +1,200 @@
+// ================================================================
+// 因子名称: PriceVolumeAggression_920_925
+// 含义:
+// 在 09:20:00 - 09:25:00 集合竞价阶段，
+// 对买单价格 orderPrice 关于时间 t_sec 做线性回归，得到 priceSlope；
+// 对买单委托量 orderVolume 关于时间 t_sec 做线性回归，得到 volumeSlope；
+// 然后在当日横截面分别做 z-score 标准化，
+// 最终因子 = z(priceSlope) + z(volumeSlope)
+//
+// ================================================================
+// PriceVolumeAggression_RelPrice_LogVol_920_925 专用调度脚本
+// 写入表: Intern_Factor_Test_agreesive
+// ================================================================
+
+
+// --- 1. 因子核心函数：先计算原始 relativePriceSlope 和 logVolumeSlope ---
+def PriceVolumeAggressionRelLog(tickOrder){
+
+    raw = select
+        securityCode,
+        orderTime,
+        double(orderPrice) as orderPrice,
+        double(orderVolume) as orderVolume,
+        marketType,
+        date(orderTime) as tradetime,
+        (time(orderTime) - 09:20:00.000) / 1000.0 as t_sec
+    from tickOrder
+    where time(orderTime) between 09:20:00.000 : 09:25:00.000
+      and side == 'B'
+      and ((marketType == 101 and orderType == 'A') or (marketType != 101))
+      and orderPrice > 0
+      and orderVolume > 0
+
+    if(count(raw) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value`priceSlope`corr_xy`buyOrderCnt`R2`slopeTstat,
+            [STRING, DATE, STRING, DOUBLE, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE]
+        )
+    }
+
+    raw = select * from raw order by securityCode, tradetime, orderTime
+
+    firstPriceTB = select
+        first(marketType) as marketType,
+        first(orderPrice) as firstPrice
+    from raw
+    group by securityCode, tradetime
+
+    data = ej(raw, firstPriceTB, `securityCode`tradetime)
+
+    data = select
+        securityCode,
+        tradetime,
+        marketType,
+        t_sec,
+        orderPrice / firstPrice - 1.0 as relPrice,
+        log(1.0 + orderVolume) as logVolume
+    from data
+    where firstPrice > 0
+
+    if(count(data) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value`priceSlope`corr_xy`buyOrderCnt`R2`slopeTstat,
+            [STRING, DATE, STRING, DOUBLE, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE]
+        )
+    }
+
+    res = select
+        covar(t_sec, relPrice) / var(t_sec) as relativePriceSlope,
+        covar(t_sec, logVolume) / var(t_sec) as logVolumeSlope,
+        count(*) as orderCnt,
+        first(marketType) as marketType
+    from data
+    group by securityCode, tradetime
+
+    return select
+        iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+        tradetime,
+        "PriceVolumeAggression_RelPrice_LogVol_920_925" as factorname,
+        0.0 as value,
+        relativePriceSlope as priceSlope,
+        logVolumeSlope as corr_xy,
+        int(orderCnt) as buyOrderCnt,
+        0.0 as R2,
+        0.0 as slopeTstat
+    from res
+    where orderCnt >= 20
+      and not isNull(relativePriceSlope)
+      and not isNull(logVolumeSlope)
+}
+
+
+// --- 2. 调度执行函数 ---
+def factorjobExec_PriceVolumeRelLog(conf){
+
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    day = conf[`startday]..conf[`endday]
+
+    // 如果日期区间包含 2026.02.06，可以跳过损坏分区
+    day = day[day != 2026.02.06]
+
+    ds = sqlDS(<select * from dataTB where date(orderTime) in day>)
+
+    res = mr(ds, conf[`func], , unionAll)
+
+    if(count(res) > 0){
+
+        temp = select * from res
+
+        stat = select
+            avg(priceSlope) as meanPriceSlope,
+            std(priceSlope) as stdPriceSlope,
+            avg(corr_xy) as meanVolumeSlope,
+            std(corr_xy) as stdVolumeSlope
+        from temp
+        group by tradetime
+
+        joined = ej(temp, stat, `tradetime)
+
+        finalTable = select
+            securityid,
+            tradetime,
+            factorname,
+
+            0.7 * iif(abs(stdPriceSlope) > 1e-12,
+                      (priceSlope - meanPriceSlope) / stdPriceSlope,
+                      0.0)
+            + 0.3 * iif(abs(stdVolumeSlope) > 1e-12,
+                      (corr_xy - meanVolumeSlope) / stdVolumeSlope,
+                      0.0)
+            as value,
+
+            double(priceSlope) as priceSlope,
+            double(corr_xy) as corr_xy,
+            int(buyOrderCnt) as buyOrderCnt,
+
+            iif(abs(stdPriceSlope) > 1e-12,
+                (priceSlope - meanPriceSlope) / stdPriceSlope,
+                0.0) as R2,
+
+            iif(abs(stdVolumeSlope) > 1e-12,
+                (corr_xy - meanVolumeSlope) / stdVolumeSlope,
+                0.0) as slopeTstat
+
+        from joined
+
+        factorTB = loadTable(conf[`factorDB], conf[`factorTB])
+        factorTB.append!(finalTable)
+
+        print("写入完成，数量: " + string(count(finalTable)))
+    }
+    else{
+        print("无有效结果")
+    }
+}
+
+
+// --- 3. 任务提交逻辑 ---
+def runPriceVolumeRelLogFactorJob(){
+
+    conf = {
+        func : PriceVolumeAggressionRelLog,
+        dataDB : "dfs://HFDataFusion",
+        dataTB : "tickOrder",
+        factorDB : "dfs://QuantFactorDay_Test",
+        factorTB : "Intern_Factor_Test_agreesive",
+        startday : 2018.01.04,
+        endday : 2025.12.31
+    }
+
+    current_memory = mem().memoryAllocated
+    current_task = count(select * from getRecentJobs() where endTime is NULL)
+
+    mem_limit = 68719476736
+
+    if(current_task < 5 and current_memory < mem_limit){
+        print("资源充足，正在提交 Job...")
+
+        submitJob(
+            "PriceVolumeRelLogJob",
+            "PriceVolumeAggression_RelPrice_LogVol_920_925",
+            factorjobExec_PriceVolumeRelLog,
+            conf
+        )
+    }
+    else{
+        msg = "资源繁忙 (内存: " + string(round(current_memory / 1024 / 1024 / 1024, 2)) + "GB, 任务数: " + string(current_task) + ")，5分钟后重试..."
+
+        print(msg)
+
+        sleep(300000)
+        runPriceVolumeRelLogFactorJob()
+    }
+}
+
+
+// --- 4. 启动 ---
+runPriceVolumeRelLogFactorJob()

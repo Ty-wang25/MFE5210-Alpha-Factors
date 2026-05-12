@@ -1,0 +1,452 @@
+// ================================================================
+// 4个30秒跟随因子 
+// 目标：一次同时计算以下4个因子
+//   1) SmallFollow30s_buy              : 大买后小买跟随
+//   2) SmallFollow30s_sell             : 大卖后小卖跟随
+//   3) BigBuy_SmallSellFollow30s       : 大买后小卖跟随
+//   4) BigSell_SmallBuyFollow30s       : 大卖后小买跟随
+// 输出表结构：securityid, tradetime, factorname, value
+// 可直接 append 到 dfs://QuantFactorDay_Test / Intern_Factor_Test_ZKZ
+// ================================================================
+
+
+// ================================================================
+// 第一部分：基础辅助函数
+// ================================================================
+
+def hasFull30sWindow(ts){
+    tt = time(ts);
+    return ((tt >= 09:30:00.000) && (tt <= 11:29:30.000)) || ((tt >= 13:00:00.000) && (tt <= 14:59:30.000));
+}
+
+
+// ================================================================
+// 第二部分：基础数据表（只构造一次）
+// ================================================================
+
+def build_base_tick_data(tickOrder){
+    data = select securityCode, marketType, execTime, execVolume,
+                  bidApplSeqNum, offerApplSeqNum, side,
+                  date(execTime) as tradingDate
+           from tickOrder
+           where side <> "4"
+             and ((time(execTime) between 09:30:00.000 and 11:30:00.000)
+               or (time(execTime) between 13:00:00.000 and 15:00:00.000));
+    return data;
+}
+
+
+// ================================================================
+// 第三部分：构造大买事件
+// ================================================================
+
+def build_big_buy_events_from_base(data){
+    bidOrders = select securityCode, tradingDate, bidApplSeqNum,
+                       min(execTime) as eventTime,
+                       sum(execVolume) as tradeVolume
+                from data
+                group by securityCode, tradingDate, bidApplSeqNum;
+
+    bigBuyEvents = select securityCode, tradingDate, bidApplSeqNum as applSeqNum,
+                          eventTime, tradeVolume
+                   from (
+                        select securityCode, tradingDate, bidApplSeqNum, eventTime, tradeVolume,
+                               rank(tradeVolume, false) as rankInGroup,
+                               count(*) as totalRows
+                        from bidOrders
+                        context by securityCode, tradingDate
+                   )
+                   where rankInGroup <= ceil(totalRows * 0.1);
+
+    bigBuyEvents = select securityCode, tradingDate, applSeqNum, eventTime, tradeVolume
+                   from bigBuyEvents
+                   where hasFull30sWindow(eventTime);
+
+    return bigBuyEvents;
+}
+
+
+// ================================================================
+// 第四部分：构造大卖事件
+// ================================================================
+
+def build_big_sell_events_from_base(data){
+    offerOrders = select securityCode, tradingDate, offerApplSeqNum,
+                         min(execTime) as eventTime,
+                         sum(execVolume) as tradeVolume
+                  from data
+                  group by securityCode, tradingDate, offerApplSeqNum;
+
+    bigSellEvents = select securityCode, tradingDate, offerApplSeqNum as applSeqNum,
+                           eventTime, tradeVolume
+                    from (
+                        select securityCode, tradingDate, offerApplSeqNum, eventTime, tradeVolume,
+                               rank(tradeVolume, false) as rankInGroup,
+                               count(*) as totalRows
+                        from offerOrders
+                        context by securityCode, tradingDate
+                    )
+                    where rankInGroup <= ceil(totalRows * 0.1);
+
+    bigSellEvents = select securityCode, tradingDate, applSeqNum, eventTime, tradeVolume
+                    from bigSellEvents
+                    where hasFull30sWindow(eventTime);
+
+    return bigSellEvents;
+}
+
+
+// ================================================================
+// 第五部分：构造小单表（买卖共用）
+// !!! 默认 side == "B" 表示主动买，side == "S" 表示主动卖 !!!
+// 如果你的库里不是这个编码，这里要改
+// ================================================================
+
+def build_small_trade_table_both(data, smallPct=30){
+    smallThreshold = select securityCode, tradingDate,
+                            percentile(execVolume, smallPct) as smallThres
+                     from data
+                     group by securityCode, tradingDate;
+
+    smallTrades = select data.securityCode, data.tradingDate, data.execTime,
+                         data.execVolume, data.marketType,
+                         iif(data.side == "B", data.execVolume, 0.0) as smallBuyVol,
+                         iif(data.side == "S", data.execVolume, 0.0) as smallSellVol
+                  from data left join smallThreshold
+                  on data.securityCode = smallThreshold.securityCode
+                     and data.tradingDate = smallThreshold.tradingDate
+                  where data.execVolume <= smallThreshold.smallThres
+                  order by securityCode, tradingDate, execTime;
+
+    return smallTrades;
+}
+
+
+// ================================================================
+// 第六部分：大买事件 -> 计算两个因子
+//   1) SmallFollow30s_buy
+//   2) BigBuy_SmallSellFollow30s
+// ================================================================
+
+def calc_big_buy_two_factors(bigBuyEvents, smallTrades){
+    result = table(100000:0,
+                   `securityCode`tradingDate`rawBuyFollow`rawSmallSellFollow,
+                   [SYMBOL, DATE, DOUBLE, DOUBLE]);
+
+    pairs = select distinct securityCode, tradingDate
+            from bigBuyEvents
+            order by securityCode, tradingDate;
+
+    if(size(pairs) == 0){
+        return result;
+    }
+
+    for(i in 0:(size(pairs)-1)){
+        sec = pairs.securityCode[i];
+        dt  = pairs.tradingDate[i];
+
+        evDay = select *
+                from bigBuyEvents
+                where securityCode = sec
+                  and tradingDate = dt
+                order by eventTime;
+
+        smDay = select *
+                from smallTrades
+                where securityCode = sec
+                  and tradingDate = dt
+                order by execTime;
+
+        if(size(evDay) == 0){
+            continue;
+        }
+
+        if(size(smDay) == 0){
+            continue;
+        }
+
+        buyFollowSum = 0.0;
+        smallSellFollowSum = 0.0;
+        validEventCnt = 0;
+
+        for(j in 0:(size(evDay)-1)){
+            thisTime = evDay.eventTime[j];
+            endTime  = thisTime + 30000;
+
+            tmp = select sum(execVolume) as smallAllVol,
+                         sum(smallBuyVol) as smallBuyVol,
+                         sum(smallSellVol) as smallSellVol
+                  from smDay
+                  where execTime > thisTime
+                    and execTime <= endTime;
+
+            sa = tmp.smallAllVol[0];
+            sb = tmp.smallBuyVol[0];
+            ss = tmp.smallSellVol[0];
+
+            if(isNull(sa)) sa = 0.0;
+            if(isNull(sb)) sb = 0.0;
+            if(isNull(ss)) ss = 0.0;
+
+            sa = double(sa);
+            sb = double(sb);
+            ss = double(ss);
+
+            if(sa > 0){
+                buyFollowSum += sb / sa;
+                smallSellFollowSum += ss / sa;
+                validEventCnt += 1;
+            }
+        }
+
+        if(validEventCnt > 0){
+            row = table(
+                take(sec, 1) as securityCode,
+                take(dt, 1) as tradingDate,
+                take(buyFollowSum / validEventCnt, 1) as rawBuyFollow,
+                take(smallSellFollowSum / validEventCnt, 1) as rawSmallSellFollow
+            );
+            result.append!(row);
+        }
+    }
+
+    return result;
+}
+
+
+// ================================================================
+// 第七部分：大卖事件 -> 计算两个因子
+//   1) SmallFollow30s_sell
+//   2) BigSell_SmallBuyFollow30s
+// ================================================================
+
+def calc_big_sell_two_factors(bigSellEvents, smallTrades){
+    result = table(100000:0,
+                   `securityCode`tradingDate`rawSellFollow`rawSmallBuyFollow,
+                   [SYMBOL, DATE, DOUBLE, DOUBLE]);
+
+    pairs = select distinct securityCode, tradingDate
+            from bigSellEvents
+            order by securityCode, tradingDate;
+
+    if(size(pairs) == 0){
+        return result;
+    }
+
+    for(i in 0:(size(pairs)-1)){
+        sec = pairs.securityCode[i];
+        dt  = pairs.tradingDate[i];
+
+        evDay = select *
+                from bigSellEvents
+                where securityCode = sec
+                  and tradingDate = dt
+                order by eventTime;
+
+        smDay = select *
+                from smallTrades
+                where securityCode = sec
+                  and tradingDate = dt
+                order by execTime;
+
+        if(size(evDay) == 0){
+            continue;
+        }
+
+        if(size(smDay) == 0){
+            continue;
+        }
+
+        sellFollowSum = 0.0;
+        smallBuyFollowSum = 0.0;
+        validEventCnt = 0;
+
+        for(j in 0:(size(evDay)-1)){
+            thisTime = evDay.eventTime[j];
+            endTime  = thisTime + 30000;
+
+            tmp = select sum(execVolume) as smallAllVol,
+                         sum(smallBuyVol) as smallBuyVol,
+                         sum(smallSellVol) as smallSellVol
+                  from smDay
+                  where execTime > thisTime
+                    and execTime <= endTime;
+
+            sa = tmp.smallAllVol[0];
+            sb = tmp.smallBuyVol[0];
+            ss = tmp.smallSellVol[0];
+
+            if(isNull(sa)) sa = 0.0;
+            if(isNull(sb)) sb = 0.0;
+            if(isNull(ss)) ss = 0.0;
+
+            sa = double(sa);
+            sb = double(sb);
+            ss = double(ss);
+
+            if(sa > 0){
+                sellFollowSum += ss / sa;
+                smallBuyFollowSum += sb / sa;
+                validEventCnt += 1;
+            }
+        }
+
+        if(validEventCnt > 0){
+            row = table(
+                take(sec, 1) as securityCode,
+                take(dt, 1) as tradingDate,
+                take(sellFollowSum / validEventCnt, 1) as rawSellFollow,
+                take(smallBuyFollowSum / validEventCnt, 1) as rawSmallBuyFollow
+            );
+            result.append!(row);
+        }
+    }
+
+    return result;
+}
+
+
+// ================================================================
+// 第八部分：合并产出4个因子
+// 返回字段：securityid, tradetime, factorname, value
+// ================================================================
+
+def FourFollow30s_factor(tickOrder){
+    data = build_base_tick_data(tickOrder);
+
+    if(size(data) == 0){
+        return table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+    }
+
+    bigBuyEvents  = build_big_buy_events_from_base(data);
+    bigSellEvents = build_big_sell_events_from_base(data);
+    smallTrades   = build_small_trade_table_both(data, 30);
+
+    buyTwo  = calc_big_buy_two_factors(bigBuyEvents, smallTrades);
+    sellTwo = calc_big_sell_two_factors(bigSellEvents, smallTrades);
+
+    baseInfo = select first(marketType) as marketType, securityCode
+               from data
+               group by securityCode;
+
+    if(size(buyTwo) > 0){
+        buyTwo = select buyTwo.securityCode, buyTwo.tradingDate,
+                        buyTwo.rawBuyFollow, buyTwo.rawSmallSellFollow,
+                        baseInfo.marketType
+                 from buyTwo left join baseInfo
+                 on buyTwo.securityCode = baseInfo.securityCode;
+
+        res1 = select case when marketType == 101 then securityCode + ".SH"
+                           else securityCode + ".SZ" end as securityid,
+                      tradingDate as tradetime,
+                      `SmallFollow30s_buy as factorname,
+                      double(rawBuyFollow) as value
+               from buyTwo;
+
+        res2 = select case when marketType == 101 then securityCode + ".SH"
+                           else securityCode + ".SZ" end as securityid,
+                      tradingDate as tradetime,
+                      `BigBuy_SmallSellFollow30s as factorname,
+                      double(rawSmallSellFollow) as value
+               from buyTwo;
+    }
+    else{
+        res1 = table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+        res2 = table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+    }
+
+    if(size(sellTwo) > 0){
+        sellTwo = select sellTwo.securityCode, sellTwo.tradingDate,
+                         sellTwo.rawSellFollow, sellTwo.rawSmallBuyFollow,
+                         baseInfo.marketType
+                  from sellTwo left join baseInfo
+                  on sellTwo.securityCode = baseInfo.securityCode;
+
+        res3 = select case when marketType == 101 then securityCode + ".SH"
+                           else securityCode + ".SZ" end as securityid,
+                      tradingDate as tradetime,
+                      `SmallFollow30s_sell as factorname,
+                      double(rawSellFollow) as value
+               from sellTwo;
+
+        res4 = select case when marketType == 101 then securityCode + ".SH"
+                           else securityCode + ".SZ" end as securityid,
+                      tradingDate as tradetime,
+                      `BigSell_SmallBuyFollow30s as factorname,
+                      double(rawSmallBuyFollow) as value
+               from sellTwo;
+    }
+    else{
+        res3 = table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+        res4 = table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+    }
+
+    tmp1 = unionAll(res1, res2);
+    tmp2 = unionAll(res3, res4);
+    resultTable = unionAll(tmp1, tmp2);
+
+    resultTable = select securityid, tradetime, factorname, value
+              from resultTable
+              order by tradetime, securityid, factorname;
+    return resultTable;
+}
+
+
+// ================================================================
+// 第九部分：任务执行框架
+// ================================================================
+
+def factorjobExec_four(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB]);
+    day = conf[`startday]..conf[`endday];
+
+    start1 = 09:30:00.000;
+    end1   = 11:30:00.000;
+    start2 = 13:00:00.000;
+    end2   = 15:00:00.000;
+
+    ds = sqlDS(<select securityCode, marketType, execTime, execVolume, bidApplSeqNum, offerApplSeqNum, side
+                from dataTB
+                where date(execTime) in day
+                  and ((time(execTime) between start1 and end1)
+                    or (time(execTime) between start2 and end2))>);
+
+    res = mr(ds, conf[`func]).unionAll();
+    res = select securityid, tradetime, factorname, value from res;
+
+    factorTB = loadTable(conf[`factorDB], conf[`factorTB]);
+    factorTB.append!(res);
+
+    print("写入完成, 记录数: " + string(size(res)));
+}
+
+
+// ================================================================
+// 第十部分：提交任务
+// ================================================================
+
+factorName = "FourFollow30s";
+factorFunc = FourFollow30s_factor;
+
+conf = {
+    funcsec   : NULL,
+    dataDB    : "dfs://HFDataFusion",
+    dataTB    : "tickExecution",
+    factorDB  : "dfs://QuantFactorDay_Test",
+    factorTB  : "Intern_Factor_Test_ZKZ",
+    startday  : 2018.01.04,
+    endday    : 2018.12.31
+};
+
+conf[`func] = factorFunc;
+conf[`factorname] = factorName;
+
+print(">>> 提交4个30秒跟随因子任务");
+submitJob("factor_job_FourFollow30s", factorName, factorjobExec_four, conf);
+
+print("=== 4个30秒跟随因子多日任务已提交! ===");
+
+
+
+
+

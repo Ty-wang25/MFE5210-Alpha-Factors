@@ -1,0 +1,231 @@
+// ================================================================
+// 漫长订单因子 + 大单改进因子 — 仅计算单个因子（示例：BigBuy_SmallSell）
+// ================================================================
+
+// ================================================================
+// 第一部分: 辅助函数（无修改）
+// ================================================================
+
+// 标记大买单和大卖单 (交易量排名前10%)
+def flag_generate(tickOrder){
+    data = select execVolume, bidApplSeqNum, offerApplSeqNum, securityCode, execTime
+           from tickOrder where side <> '4';
+
+    bidVolume = select sum(execVolume) as bidTradeVolume, securityCode,
+                       date(execTime) as tradingDate, bidApplSeqNum
+                from data
+                group by securityCode, execTime.date() as tradingDate, bidApplSeqNum;
+
+    offerVolume = select sum(execVolume) as offerTradeVolume, securityCode,
+                         date(execTime) as tradingDate, offerApplSeqNum
+                  from data
+                  group by securityCode, execTime.date() as tradingDate, offerApplSeqNum;
+
+    totalVolume = select sum(execVolume) as totalTradeVolume, securityCode,
+                         date(execTime) as tradingDate
+                  from data
+                  group by securityCode, execTime.date() as tradingDate;
+
+    bidThreshold = select securityCode, tradingDate, bidTradeVolume
+                   from (
+                       select securityCode, tradingDate, bidTradeVolume,
+                              rank(bidTradeVolume, false) as rankInGroup,
+                              count(*) as totalRows
+                       from bidVolume
+                       context by securityCode, tradingDate)
+                   where rankInGroup <= ceil(totalRows * 0.1);
+    bidThreshold = select min(bidTradeVolume) as thres, securityCode, tradingDate
+                   from bidThreshold group by securityCode, tradingDate;
+
+    offerThreshold = select securityCode, tradingDate, offerTradeVolume
+                     from (
+                         select securityCode, tradingDate, offerTradeVolume,
+                                rank(offerTradeVolume, false) as rankInGroup,
+                                count(*) as totalRows
+                         from offerVolume
+                         context by securityCode, tradingDate)
+                     where rankInGroup <= ceil(totalRows * 0.1);
+    offerThreshold = select min(offerTradeVolume) as thres, securityCode, tradingDate
+                     from offerThreshold group by securityCode, tradingDate;
+
+    bigBuyTrades = lj(bidVolume, bidThreshold, `securityCode`tradingDate);
+    bigBuyTrades = select securityCode, tradingDate, bidApplSeqNum, bidTradeVolume,
+                          (bidTradeVolume > thres) as isBigBuy
+                   from bigBuyTrades;
+
+    bigSellTrades = lj(offerVolume, offerThreshold, `securityCode`tradingDate);
+    bigSellTrades = select securityCode, tradingDate, offerApplSeqNum, offerTradeVolume,
+                           (offerTradeVolume > thres) as isBigSell
+                    from bigSellTrades;
+
+    alter table data add COLUMN tradingDate DATE;
+    update data set tradingDate = date(data.execTime);
+
+    flag = SELECT data.execVolume, data.bidApplSeqNum, data.offerApplSeqNum,
+                  data.securityCode, data.tradingDate, bigBuyTrades.isBigBuy
+           FROM data LEFT JOIN bigBuyTrades
+           ON bigBuyTrades.securityCode = data.securityCode
+              AND data.tradingDate = bigBuyTrades.tradingDate
+              AND data.bidApplSeqNum = bigBuyTrades.bidApplSeqNum;
+
+    flag = SELECT flag.execVolume, flag.bidApplSeqNum, flag.offerApplSeqNum,
+                  flag.securityCode, flag.tradingDate, flag.isBigBuy,
+                  bigSellTrades.isBigSell
+           FROM flag LEFT JOIN bigSellTrades
+           ON bigSellTrades.securityCode = flag.securityCode
+              AND flag.tradingDate = bigSellTrades.tradingDate
+              AND flag.offerApplSeqNum = bigSellTrades.offerApplSeqNum;
+
+    return flag;
+}
+
+// 标记漫长订单 (持续时间排名前10%)
+def time_flag_generate(tickOrder){
+    data = select execVolume, bidApplSeqNum, offerApplSeqNum, securityCode, execTime,
+                  temporalParse(temporalFormat(execTime, "yyyy-MM-dd HH:mm:ss"), "yyyy-MM-dd HH:mm:ss") as TradingDate
+           from tickOrder where side <> '4';
+
+    bidVolume = select securityCode, tradingDate, bidApplSeqNum,
+                       max(execTime) as maxT, min(execTime) as minT,
+                       max(execTime) - min(execTime) as duration
+                from data group by securityCode, tradingDate, bidApplSeqNum;
+    bidVolume = select securityCode, tradingDate, bidApplSeqNum, maxT, minT,
+                       case when (time(maxT) >= 13:00:00) and (time(minT) <= 11:30:00)
+                            then duration - 5400000 else duration end as duration
+                from bidVolume;
+
+    offerVolume = select securityCode, tradingDate, offerApplSeqNum,
+                         max(execTime) as maxT, min(execTime) as minT,
+                         max(execTime) - min(execTime) as duration
+                  from data group by securityCode, tradingDate, offerApplSeqNum;
+    offerVolume = select securityCode, tradingDate, offerApplSeqNum, maxT, minT,
+                         case when (time(maxT) >= 13:00:00) and (time(minT) <= 11:30:00)
+                              then duration - 5400000 else duration end as duration
+                  from offerVolume;
+
+    bidThreshold = select percentile(duration, 90) as thres, securityCode, tradingDate
+                   from bidVolume group by securityCode, tradingDate;
+    bigBuyTrades = lj(bidVolume, bidThreshold, `securityCode`tradingDate);
+    bigBuyTrades = select securityCode, tradingDate, bidApplSeqNum,
+                          (duration > thres) as isLongBuy from bigBuyTrades;
+
+    offerThreshold = select percentile(duration, 90) as thres, securityCode, tradingDate
+                     from offerVolume group by securityCode, tradingDate;
+    bigSellTrades = lj(offerVolume, offerThreshold, `securityCode`tradingDate);
+    bigSellTrades = select securityCode, tradingDate, offerApplSeqNum,
+                           (duration > thres) as isLongSell from bigSellTrades;
+
+    flag = select data.execVolume, data.bidApplSeqNum, data.offerApplSeqNum,
+                  data.securityCode, data.tradingDate, bigBuyTrades.isLongBuy
+           from data left join bigBuyTrades
+           on bigBuyTrades.securityCode = data.securityCode
+              and data.tradingDate = bigBuyTrades.tradingDate
+              and data.bidApplSeqNum = bigBuyTrades.bidApplSeqNum;
+
+    flag = select flag.execVolume, flag.bidApplSeqNum, flag.offerApplSeqNum,
+                  flag.securityCode, flag.tradingDate, flag.isLongBuy,
+                  bigSellTrades.isLongSell
+           from flag left join bigSellTrades
+           on bigSellTrades.securityCode = flag.securityCode
+              and flag.tradingDate = bigSellTrades.tradingDate
+              and flag.offerApplSeqNum = bigSellTrades.offerApplSeqNum;
+
+    return flag;
+}
+
+// ================================================================
+// 第二部分: 因子函数（仅保留需要计算的因子）
+// ================================================================
+def BigBuy_BigSell(tickOrder){
+    data = select execVolume, bidApplSeqNum, offerApplSeqNum, securityCode, execTime, marketType from tickOrder;
+    flag = flag_generate(tickOrder)
+    big_buy_data = select * from flag where isBigBuy = true and isBigSell = true;
+    totalVolume = select sum(execVolume) as totalTradeVolume, securityCode, date(execTime) as tradingDate
+                  from data group by securityCode, execTime.date() as tradingDate;
+    bidVolumeRatio = select sum(execVolume) as big_buy_sum from big_buy_data group by securityCode, tradingDate;
+    bidVolumeRatio = SELECT securityCode, tradingDate, big_buy_sum, totalTradeVolume
+                     FROM bidVolumeRatio LEFT JOIN totalVolume
+                     ON bidVolumeRatio.securityCode = totalVolume.securityCode
+                        AND bidVolumeRatio.tradingDate = totalVolume.tradingDate;
+    alter table bidVolumeRatio add COLUMN bidVolumeRatio FLOAT;
+    update bidVolumeRatio set bidVolumeRatio = cast(big_buy_sum, FLOAT) / cast(totalTradeVolume, FLOAT) where totalTradeVolume <> 0;
+    resultTable = select bidVolumeRatio.securityCode, bidVolumeRatio.tradingDate,
+                         bidVolumeRatio.bidVolumeRatio AS bid_ratio from bidVolumeRatio;
+    alter table resultTable add COLUMN VolumeBigOrigin FLOAT;
+    update resultTable set VolumeBigOrigin = bid_ratio;
+    resultTable = select securityCode, tradingDate, VolumeBigOrigin from resultTable;
+    alter table resultTable add COLUMN factorName SYMBOL;
+    update resultTable set factorName = "BigBuy_BigSell";
+    resultTable = select securityCode, tradingDate, VolumeBigOrigin, marketType, factorName
+                  from resultTable left semijoin data on resultTable.securityCode = data.securityCode;
+    resultTable = select case when marketType == 101 then securityCode + ".SH"
+                              else securityCode + ".SZ" end as securityCode,
+                         tradingDate as tradeDate, factorName, double(VolumeBigOrigin) as value
+                  from resultTable order by tradeDate;
+    return resultTable;
+}
+
+
+
+// ================================================================
+// 第三部分: 任务提交框架
+// ================================================================
+
+def factorjobExec(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    day = conf[`startday]..conf[`endday]
+    start1 = 09:15:00.000
+    end1 = 11:30:00.000
+    start2 = 13:00:00.000
+    end2 = 15:00:00.000
+    ds = sqlDS(<select * from dataTB where date(execTime) in day and ((time(execTime) between start1 and end1) or (time(execTime) between start2 and end2))>)
+    res = mr(ds, conf[`func]).unionAll()
+    
+    // 确保 factorname 列存在且类型正确，用于分区路由
+   res = select 
+        securityCode as securityid,
+        tradeDate as tradetime,
+        factorName as factorname,
+        value
+      from res
+    
+    factorTB = loadTable(conf[`factorDB], conf[`factorTB])
+    // append! 会自动根据 factorname 路由到对应二级分区
+    factorTB.append!(res)
+}
+
+// ================================================================
+// 第四部分: 仅提交单个因子任务
+// ================================================================
+
+
+factorName = "BigBuy_BigSell"  // 要计算的因子名
+factorFunc = BigBuy_BigSell  // 对应的因子函数
+
+// 配置参数
+conf = {
+    funcsec   : NULL,
+    dataDB    : "dfs://HFDataFusion",
+    dataTB    : "tickExecution",
+    factorDB  : "dfs://QuantFactorDay_Test",
+    factorTB  : "Intern_Factor_Test_ZKZ",
+    startday  : 2018.01.01,
+    endday    : 2018.01.05
+}
+conf[`func] = factorFunc
+conf[`factorname] = factorName
+
+// 提交单个因子任务
+print(">>> 提交因子: " + factorName)
+submitJob("factor_job_" + factorName, factorName, factorjobExec, conf)
+
+print("=== 单个因子任务已提交! ===")
+
+
+
+
+
+
+
+
+

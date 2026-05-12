@@ -1,0 +1,247 @@
+// ================================================================
+// CallAuctionMidSlope_920_925_AllMkt_Filtered - 全市场过滤优化版
+//
+// 优化点：
+// 1. 用真实时间数值轴回归，避免不规则快照频率带来偏差
+// 2. 对 log(midPrice) 回归，直接得到相对斜率
+// 3. 最小有效点数提高到 8
+// 4. 对竞价阶段几乎不动的路径直接过滤
+// 5. 对极接近 0 的斜率直接过滤，不参与截面排序
+// 6. 作为新因子入库，不覆盖旧因子
+// ================================================================
+
+factorName = "CallAuctionMidSlope_920_925_AllMkt_Filtered";
+
+// ================================================================
+// 第一部分：辅助函数
+// ================================================================
+
+def empty_factor_result_table(){
+    return table(1:0, `securityCode`tradeDate`factorName`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+}
+
+def empty_intermediate_table(){
+    return table(1:0, `securityCode`tradeDate`marketType`factorValue, [SYMBOL, DATE, INT, DOUBLE]);
+}
+
+def build_snapshot_mid_data(snapshot){
+    res = select int(marketType) as marketType,
+                 securityCode,
+                 origTime,
+                 date(origTime) as tradingDate,
+                 double(bidPrice[0]) as bid1,
+                 double(offerPrice[0]) as ask1
+          from snapshot
+          where time(origTime) between 09:20:00.000 and 09:25:00.000
+          order by securityCode, date(origTime), origTime;
+
+    res = select marketType,
+                 securityCode,
+                 origTime,
+                 tradingDate,
+                 iif(bid1 > 0, bid1, double(NULL)) as bid1,
+                 iif(ask1 > 0, ask1, double(NULL)) as ask1
+          from res;
+
+    res = select marketType,
+                 securityCode,
+                 origTime,
+                 tradingDate,
+                 double((bid1 + ask1) / 2.0) as midPrice
+          from res
+          where not isNull(bid1) and not isNull(ask1);
+
+    return res;
+}
+
+def calc_log_mid_slope_by_time(timeVec, midVec){
+    n = size(midVec);
+    if(n < 8){
+        return double(NULL);
+    }
+
+    x = double(long(timeVec) - long(timeVec[0]));
+    y = log(double(midVec));
+
+    xMean = avg(x);
+    yMean = avg(y);
+
+    denom = sum(pow(x - xMean, 2.0));
+    if(denom <= 0){
+        return double(NULL);
+    }
+
+    numer = sum((x - xMean) * (y - yMean));
+    return double(numer / denom);
+}
+
+// ================================================================
+// 第二部分：单只股票单日因子
+// ================================================================
+
+def calc_one_stock_one_day_factor_slope_filtered(oneSec){
+    if(size(oneSec) == 0){
+        return empty_intermediate_table();
+    }
+
+    validCall = select origTime, midPrice
+                from oneSec
+                where not isNull(midPrice) and midPrice > 0
+                order by origTime;
+
+    if(size(validCall) < 8){
+        return empty_intermediate_table();
+    }
+
+    sec = oneSec.securityCode[0];
+    dt = oneSec.tradingDate[0];
+    mkt = int(oneSec.marketType[0]);
+
+    midVec = double(validCall.midPrice);
+    midStart = midVec[0];
+    if(isNull(midStart) || midStart <= 0){
+        return empty_intermediate_table();
+    }
+
+    retRange = (max(midVec) - min(midVec)) / midStart;
+
+    // 路径过于平直，视为无效样本
+    if(isNull(retRange) || retRange < 0.0005){
+        return empty_intermediate_table();
+    }
+
+    slope = calc_log_mid_slope_by_time(validCall.origTime, midVec);
+    if(isNull(slope)){
+        return empty_intermediate_table();
+    }
+
+    // 极接近 0 的斜率不参与排序
+    if(abs(slope) < 1e-10){
+        return empty_intermediate_table();
+    }
+
+    return table(
+        take(sec, 1) as securityCode,
+        take(dt, 1) as tradeDate,
+        take(mkt, 1) as marketType,
+        take(double(slope), 1) as factorValue
+    );
+}
+
+// ================================================================
+// 第三部分：单日全市场因子
+// ================================================================
+
+def CallAuctionMidSlope_920_925_AllMkt_Filtered(snapshot){
+    midSnap = build_snapshot_mid_data(snapshot);
+    if(size(midSnap) == 0){
+        return empty_factor_result_table();
+    }
+
+    result = table(10000:0, `securityCode`tradeDate`marketType`factorValue, [SYMBOL, DATE, INT, DOUBLE]);
+
+    pairs = select distinct securityCode, tradingDate
+            from midSnap
+            order by securityCode, tradingDate;
+
+    if(size(pairs) == 0){
+        return empty_factor_result_table();
+    }
+
+    for(i in 0:(size(pairs) - 1)){
+        sec = pairs.securityCode[i];
+        dt = pairs.tradingDate[i];
+
+        oneSec = select *
+                 from midSnap
+                 where securityCode = sec and tradingDate = dt
+                 order by origTime;
+
+        oneRes = calc_one_stock_one_day_factor_slope_filtered(oneSec);
+        if(size(oneRes) > 0){
+            result.append!(oneRes);
+        }
+    }
+
+    if(size(result) == 0){
+        return empty_factor_result_table();
+    }
+
+    return select symbol(iif(marketType == 101, securityCode + ".SH",
+                             iif(marketType == 102, securityCode + ".SZ", securityCode + "." + string(marketType)))) as securityCode,
+                  tradeDate,
+                  `CallAuctionMidSlope_920_925_AllMkt_Filtered as factorName,
+                  double(factorValue) as value
+           from result
+           order by tradeDate, securityCode;
+}
+
+// ================================================================
+// 第四部分：任务执行函数
+// ================================================================
+
+def factorjobExec_callAuctionMidSlope_allMkt_filtered(conf){
+    snapTB = loadTable(conf[`snapDB], conf[`snapTB]);
+    factorTB = loadTable(conf[`factorDB], conf[`factorTB]);
+
+    days = conf[`startday]..conf[`endday];
+
+    for(day in days){
+        print(">>> processing " + string(day));
+
+        delete from factorTB where tradetime = day, factorname = `CallAuctionMidSlope_920_925_AllMkt_Filtered;
+
+        snapData = select marketType,
+                          securityCode,
+                          origTime,
+                          bidPrice,
+                          offerPrice
+                   from snapTB
+                   where date(origTime) = day
+                     and time(origTime) between 09:20:00.000 and 09:25:00.000;
+
+        if(size(snapData) == 0){
+            continue;
+        }
+
+        res = CallAuctionMidSlope_920_925_AllMkt_Filtered(snapData);
+        if(size(res) > 0){
+            factorTB.append!(select securityCode as securityid,
+                                    tradeDate as tradetime,
+                                    factorName as factorname,
+                                    value
+                             from res);
+        }
+    }
+}
+
+// ================================================================
+// 第五部分：提交任务
+// ================================================================
+
+conf = {
+    snapDB   : "dfs://HFDataFusion",
+    snapTB   : "snapshot",
+    factorDB : "dfs://QuantFactorDay_Test",
+    factorTB : "Intern_Factor_Test_ZKZ",
+    startday : 2019.01.01,
+    endday   : 2026.03.31
+};
+
+print(">>> 提交 CallAuctionMidSlope_920_925_AllMkt_Filtered 任务");
+submitJob(
+    "factor_job_CallAuctionMidSlope_920_925_AllMkt_Filtered",
+    factorName,
+    factorjobExec_callAuctionMidSlope_allMkt_filtered,
+    conf
+);
+print("=== 任务已提交! ===");
+
+factorTB = loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_ZKZ");
+select count(*) as cnt
+from factorTB
+where factorname = `CallAuctionMidSlope_920_925_AllMkt_Filtered;
+
+
+
+

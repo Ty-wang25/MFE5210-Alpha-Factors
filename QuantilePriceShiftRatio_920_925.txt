@@ -1,0 +1,201 @@
+// ================================================================
+// 因子名称: QuantilePriceShiftRatio_920_925more
+// 写入表: dfs://QuantFactorDay_Test / Intern_Factor_Test_agreesive
+
+// 因子含义:
+// 在 09:20:00 - 09:25:00 集合竞价阶段，
+// 将买单分成前半段(09:20:00-09:22:30)和后半段(09:22:30-09:25:00)，
+// 分别计算 orderPrice 的 80% 分位数：
+//   q80_early, q80_late
+// 因子值定义为：
+//   q80_late / q80_early - 1
+//
+// 输出表:
+// dfs://QuantFactorDay_Test / Intern_Factor_Test_WTY
+// 字段:
+// securityid, tradetime, factorname, value
+// 
+//
+// 字段含义映射:
+// value       = q80_late / q80_early - 1
+// priceSlope  = q80_late - q80_early
+// corr_xy     = q80_late / q80_early
+// buyOrderCnt = cnt_early + cnt_late
+// R2          = q80_early
+// slopeTstat  = q80_late
+// ================================================================
+
+
+// ================================================================
+// 1. 空表函数
+// ================================================================
+def emptyQuantileMoreTable(){
+    return table(
+        100:0,
+        `securityid`tradetime`factorname`value`priceSlope`corr_xy`buyOrderCnt`R2`slopeTstat,
+        [STRING, DATE, STRING, DOUBLE, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE]
+    )
+}
+
+
+// ================================================================
+// 2. 因子核心函数
+// ================================================================
+def QuantilePriceShiftRatioMore(tickOrder){
+
+    raw = select
+            securityCode,
+            marketType,
+            double(orderPrice) as orderPrice,
+            time(orderTime) as orderTimeOnly,
+            date(orderTime) as tradetime
+          from tickOrder
+          where time(orderTime) between 09:20:00.000 : 09:25:00.000
+            and string(side) = "B"
+            and ((marketType == 101 and string(orderType) = "A") or (marketType != 101))
+            and orderPrice > 0
+
+    if(count(raw) == 0){
+        return emptyQuantileMoreTable()
+    }
+
+    earlyPart = select
+                  first(marketType) as marketType,
+                  percentile(orderPrice, 80) as q80_early,
+                  count(*) as cnt_early
+                from raw
+                where orderTimeOnly between 09:20:00.000 : 09:22:30.000
+                group by securityCode, tradetime
+
+    latePart = select
+                 percentile(orderPrice, 80) as q80_late,
+                 count(*) as cnt_late
+               from raw
+               where orderTimeOnly between 09:22:30.000 : 09:25:00.000
+               group by securityCode, tradetime
+
+    if(count(earlyPart) == 0 or count(latePart) == 0){
+        return emptyQuantileMoreTable()
+    }
+
+    joined = ej(earlyPart, latePart, `securityCode`tradetime)
+
+    if(count(joined) == 0){
+        return emptyQuantileMoreTable()
+    }
+
+    res = select
+            iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+            tradetime,
+            "QuantilePriceShiftRatio_920_925more" as factorname,
+
+            // 主因子值
+            iif(
+                cnt_early >= 1 and cnt_late >= 1 and q80_early > 0,
+                q80_late / q80_early - 1,
+                NULL
+            ) as value,
+
+            // 以下字段借用 agreesive 表原有列名保存辅助指标
+            q80_late - q80_early as priceSlope,
+
+            iif(
+                q80_early > 0,
+                q80_late / q80_early,
+                NULL
+            ) as corr_xy,
+
+            int(cnt_early + cnt_late) as buyOrderCnt,
+
+            q80_early as R2,
+
+            q80_late as slopeTstat
+
+          from joined
+
+    return select * from res where not isNull(value)
+}
+
+
+// ================================================================
+// 3. 调度执行函数
+// ================================================================
+def factorjobExec_QuantileMore(conf){
+
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    day = conf[`startday]..conf[`endday]
+
+    ds = sqlDS(<select * from dataTB where date(orderTime) in day>)
+
+    res = mr(ds, conf[`func], , unionAll)
+
+    if(count(res) > 0){
+        finalTable = select
+                        securityid,
+                        tradetime,
+                        factorname,
+                        double(value) as value,
+                        double(priceSlope) as priceSlope,
+                        double(corr_xy) as corr_xy,
+                        int(buyOrderCnt) as buyOrderCnt,
+                        double(R2) as R2,
+                        double(slopeTstat) as slopeTstat
+                     from res
+
+        factorTB = loadTable(conf[`factorDB], conf[`factorTB])
+        factorTB.append!(finalTable)
+
+        print("写入完成，数量: " + string(count(finalTable)))
+    }
+    else{
+        print("无有效结果")
+    }
+}
+
+
+// ================================================================
+// 4. 任务提交逻辑
+// ================================================================
+def runQuantileMoreFactorJob(){
+
+    conf = {
+        func : QuantilePriceShiftRatioMore,
+        dataDB : "dfs://HFDataFusion",
+        dataTB : "tickOrder",
+        factorDB : "dfs://QuantFactorDay_Test",
+        factorTB : "Intern_Factor_Test_agreesive",
+        startday : 2026.01.01,
+        endday : 2026.03.31
+    }
+
+    current_memory = mem().memoryAllocated
+    current_task = count(select * from getRecentJobs() where endTime is NULL)
+    mem_limit = 68719476736
+
+    if(current_task < 5 and current_memory < mem_limit){
+        print("资源充足，正在提交 Job...")
+
+        submitJob(
+            "QuantilePriceShiftRatioMoreJob",
+            "QuantilePriceShiftRatio_920_925more",
+            factorjobExec_QuantileMore,
+            conf
+        )
+    }
+    else{
+        msg = "资源繁忙，5分钟后重试。当前内存GB: " + string(round(current_memory / 1024 / 1024 / 1024, 2))  + ", 当前任务数: " + string(current_task)
+
+        print(msg)
+
+        sleep(300000)
+        runQuantileMoreFactorJob()
+    }
+}
+
+
+// ================================================================
+// 5. 启动
+// ================================================================
+runQuantileMoreFactorJob()
+
+

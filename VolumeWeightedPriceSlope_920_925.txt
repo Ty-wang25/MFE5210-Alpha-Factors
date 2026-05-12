@@ -1,0 +1,131 @@
+// ================================================================
+// 因子名称: VolumeWeightedPriceSlope_920_925
+// 含义:
+// 在 09:20:00 - 09:25:00 集合竞价阶段，
+// 对买单价格 orderPrice 关于时间 t_sec 做“按委托量 orderVolume 加权”的线性回归，
+// 取加权回归斜率作为因子值。
+// 
+// 因子公式:
+// slope_w = Cov_w(t, p) / Var_w(t)
+// 其中权重 w = orderVolume
+//
+// 输出表:
+// dfs://QuantFactorDay_Test / Intern_Factor_Test_WTY
+// 字段: securityid, tradetime, factorname, value
+// ================================================================
+
+
+
+// ================================================================
+// 1. 单日计算函数
+// ================================================================
+def calcVolumeWeightedPriceSlopeOneDay(tradeDate){
+    
+    orderTB = loadTable("dfs://HFDataFusion", "tickOrder")
+    
+    // ---------- 取 09:20 - 09:25 的买单 ----------
+    // 逻辑延续你前面的 PriceAggressionSlopeFull：
+    // 1) 只看买单
+    // 2) marketType == 101 时，仅保留 orderType == 'A'
+    // 3) 只保留 orderPrice > 0, orderVolume > 0
+    raw = select
+            securityCode,
+            marketType,
+            double(orderPrice) as orderPrice,
+            double(orderVolume) as orderVolume,
+            (time(orderTime) - 09:20:00.000) / 1000.0 as t_sec
+          from orderTB
+          where date(orderTime) = tradeDate
+            and time(orderTime) between 09:20:00.000 : 09:25:00.000
+            and string(side) = "B"
+            and ((marketType == 101 and string(orderType) = "A") or (marketType != 101))
+            and orderPrice > 0
+            and orderVolume > 0
+
+    // ---------- 若当天无数据，直接返回空表 ----------
+    if(count(raw) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value,
+            [SYMBOL, DATE, SYMBOL, DOUBLE]
+        )
+    }
+
+    // ---------- 先按股票聚合，计算加权回归所需统计量 ----------
+    // sw   = sum(w)
+    // swt  = sum(w * t)
+    // swp  = sum(w * p)
+    // swtt = sum(w * t^2)
+    // swtp = sum(w * t * p)
+    agg = select
+            sum(orderVolume) as sw,
+            sum(orderVolume * t_sec) as swt,
+            sum(orderVolume * orderPrice) as swp,
+            sum(orderVolume * t_sec * t_sec) as swtt,
+            sum(orderVolume * t_sec * orderPrice) as swtp,
+            count(*) as orderCnt,
+            first(marketType) as marketType
+          from raw
+          group by securityCode
+
+    // ---------- 计算加权 slope ----------
+    // mean_t = swt / sw
+    // mean_p = swp / sw
+    // cov_w  = swtp / sw - mean_t * mean_p
+    // var_w  = swtt / sw - mean_t^2
+    // slope  = cov_w / var_w
+    res = select
+        iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+        tradeDate as tradetime,
+        "VolumeWeightedPriceSlope_920_925" as factorname,
+        double(
+            iif(
+                sw > 0 and orderCnt >= 2 and abs(swtt / sw - (swt / sw) * (swt / sw)) > 1e-12,
+                (swtp / sw - (swt / sw) * (swp / sw)) / (swtt / sw - (swt / sw) * (swt / sw)),
+                NULL
+            )
+        ) as value
+      from agg
+
+    // 只保留成功算出 slope 的股票
+    return select * from res where not isNull(value)
+}
+
+
+
+// ================================================================
+// 2. 批量运行并写入因子表
+// ================================================================
+def runVolumeWeightedPriceSlopeJob(startDate, endDate){
+
+    factorTB = loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_WTY")
+    totalWritten = 0
+    days = startDate..endDate
+
+    for(d in days){
+        ans = calcVolumeWeightedPriceSlopeOneDay(d)
+
+        if(count(ans) > 0){
+            factorTB.append!(ans)
+            totalWritten = totalWritten + count(ans)
+            print(string(d) + " 写入完成, 条数: " + string(count(ans)))
+        }
+        else{
+            print(string(d) + " 无有效结果")
+        }
+    }
+
+    print("全部完成，总写入条数: " + string(totalWritten))
+}
+
+
+
+// ================================================================
+// 3. 启动运行
+// ================================================================
+// 你可以自行修改日期区间
+runVolumeWeightedPriceSlopeJob(2026.01.01, 2026.03.31)
+
+
+
+

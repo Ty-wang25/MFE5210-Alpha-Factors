@@ -1,0 +1,427 @@
+// ================================================================
+// QuietBigBuy30s + FollowedBigSell30s
+// 逻辑：
+//   1) QuietBigBuy30s:
+//      大买事件后30秒内，小单主动买跟随越少越好
+//
+//   2) FollowedBigSell30s:
+//      大卖事件后30秒内，小单主动卖跟随越多越好
+//
+// 输出表结构：securityid, tradetime, factorname, value
+// 可直接 append 到 dfs://QuantFactorDay_Test / Intern_Factor_Test_ZKZ
+// ================================================================
+
+
+// ================================================================
+// 第一部分：辅助函数
+// ================================================================
+
+def hasFull30sWindow(ts){
+    tt = time(ts);
+    return ((tt >= 09:30:00.000) && (tt <= 11:29:30.000)) || ((tt >= 13:00:00.000) && (tt <= 14:59:30.000));
+}
+
+
+// ================================================================
+// 第二部分：基础数据表
+// ================================================================
+
+def build_base_tick_data(tickOrder){
+    data = select securityCode, marketType, execTime, execVolume,
+                  bidApplSeqNum, offerApplSeqNum, side,
+                  date(execTime) as tradingDate
+           from tickOrder
+           where side <> "4"
+             and ((time(execTime) between 09:30:00.000 and 11:30:00.000)
+               or (time(execTime) between 13:00:00.000 and 15:00:00.000));
+    return data;
+}
+
+
+// ================================================================
+// 第三部分：构造大买 / 大卖事件
+// 沿用你之前“大单按订单聚合后取前10%”的口径
+// ================================================================
+
+def build_big_buy_events_from_base(data){
+    bidOrders = select securityCode, tradingDate, bidApplSeqNum,
+                       min(execTime) as eventTime,
+                       sum(execVolume) as bigVol
+                from data
+                where not isNull(bidApplSeqNum)
+                group by securityCode, tradingDate, bidApplSeqNum;
+
+    bigBuyEvents = select securityCode, tradingDate,
+                          bidApplSeqNum as applSeqNum,
+                          eventTime, bigVol
+                   from (
+                        select securityCode, tradingDate, bidApplSeqNum, eventTime, bigVol,
+                               rank(bigVol, false) as rankInGroup,
+                               count(*) as totalRows
+                        from bidOrders
+                        context by securityCode, tradingDate
+                   )
+                   where rankInGroup <= ceil(totalRows * 0.1);
+
+    bigBuyEvents = select securityCode, tradingDate, applSeqNum, eventTime, bigVol
+                   from bigBuyEvents
+                   where hasFull30sWindow(eventTime);
+
+    return bigBuyEvents;
+}
+
+def build_big_sell_events_from_base(data){
+    offerOrders = select securityCode, tradingDate, offerApplSeqNum,
+                         min(execTime) as eventTime,
+                         sum(execVolume) as bigVol
+                  from data
+                  where not isNull(offerApplSeqNum)
+                  group by securityCode, tradingDate, offerApplSeqNum;
+
+    bigSellEvents = select securityCode, tradingDate,
+                           offerApplSeqNum as applSeqNum,
+                           eventTime, bigVol
+                    from (
+                        select securityCode, tradingDate, offerApplSeqNum, eventTime, bigVol,
+                               rank(bigVol, false) as rankInGroup,
+                               count(*) as totalRows
+                        from offerOrders
+                        context by securityCode, tradingDate
+                    )
+                    where rankInGroup <= ceil(totalRows * 0.1);
+
+    bigSellEvents = select securityCode, tradingDate, applSeqNum, eventTime, bigVol
+                    from bigSellEvents
+                    where hasFull30sWindow(eventTime);
+
+    return bigSellEvents;
+}
+
+
+// ================================================================
+// 第四部分：构造小单表
+// smallPct = 30 表示日内成交量30分位数以下定义为小单
+//
+// side == "B" : 主动买
+// side == "S" : 主动卖
+// ================================================================
+
+def build_small_trade_table_both(data, smallPct=30){
+    smallThreshold = select securityCode, tradingDate,
+                            percentile(execVolume, smallPct) as smallThres
+                     from data
+                     group by securityCode, tradingDate;
+
+    smallTrades = select data.securityCode, data.tradingDate, data.execTime,
+                         data.execVolume, data.marketType,
+                         iif(data.side == "B", data.execVolume, 0.0) as smallBuyVol,
+                         iif(data.side == "S", data.execVolume, 0.0) as smallSellVol
+                  from data left join smallThreshold
+                  on data.securityCode = smallThreshold.securityCode
+                     and data.tradingDate = smallThreshold.tradingDate
+                  where data.execVolume <= smallThreshold.smallThres
+                  order by securityCode, tradingDate, execTime;
+
+    return smallTrades;
+}
+
+
+// ================================================================
+// 第五部分：筛选“安静大买”事件
+// 条件：大买后30秒内，小单主动买占比 <= thetaBuy
+// ================================================================
+
+def filter_quiet_big_buy_events(bigBuyEvents, smallTrades, thetaBuy=0.05){
+    result = table(100000:0,
+                   `securityCode`tradingDate`eventTime`bigVol`followSmallBuyVol`smallBuyRatio30s,
+                   [SYMBOL, DATE, NANOTIMESTAMP, DOUBLE, DOUBLE, DOUBLE]);
+
+    pairs = select distinct securityCode, tradingDate
+            from bigBuyEvents
+            order by securityCode, tradingDate;
+
+    if(size(pairs) == 0){
+        return result;
+    }
+
+    for(i in 0:(size(pairs)-1)){
+        sec = pairs.securityCode[i];
+        dt  = pairs.tradingDate[i];
+
+        evDay = select *
+                from bigBuyEvents
+                where securityCode = sec
+                  and tradingDate = dt
+                order by eventTime;
+
+        smDay = select *
+                from smallTrades
+                where securityCode = sec
+                  and tradingDate = dt
+                order by execTime;
+
+        if(size(evDay) == 0){
+            continue;
+        }
+
+        for(j in 0:(size(evDay)-1)){
+            thisTime = evDay.eventTime[j];
+            endTime  = thisTime + 30000;
+            bigVol   = double(evDay.bigVol[j]);
+
+            if(isNull(bigVol) || bigVol <= 0){
+                continue;
+            }
+
+            tmp = select sum(smallBuyVol) as followBuyVol
+                  from smDay
+                  where execTime > thisTime
+                    and execTime <= endTime;
+
+            sb = tmp.followBuyVol[0];
+            if(isNull(sb)) sb = 0.0;
+            sb = double(sb);
+
+            ratio = sb / bigVol;
+
+            if(ratio <= thetaBuy){
+                row = table(
+                    take(sec, 1) as securityCode,
+                    take(dt, 1) as tradingDate,
+                    take(thisTime, 1) as eventTime,
+                    take(bigVol, 1) as bigVol,
+                    take(sb, 1) as followSmallBuyVol,
+                    take(ratio, 1) as smallBuyRatio30s
+                );
+                result.append!(row);
+            }
+        }
+    }
+
+    return result;
+}
+
+
+// ================================================================
+// 第六部分：筛选“被跟随的大卖”事件
+// 条件：大卖后30秒内，小单主动卖占比 >= thetaSell
+// ================================================================
+
+def filter_followed_big_sell_events(bigSellEvents, smallTrades, thetaSell=0.05){
+    result = table(100000:0,
+                   `securityCode`tradingDate`eventTime`bigVol`followSmallSellVol`smallSellRatio30s,
+                   [SYMBOL, DATE, NANOTIMESTAMP, DOUBLE, DOUBLE, DOUBLE]);
+
+    pairs = select distinct securityCode, tradingDate
+            from bigSellEvents
+            order by securityCode, tradingDate;
+
+    if(size(pairs) == 0){
+        return result;
+    }
+
+    for(i in 0:(size(pairs)-1)){
+        sec = pairs.securityCode[i];
+        dt  = pairs.tradingDate[i];
+
+        evDay = select *
+                from bigSellEvents
+                where securityCode = sec
+                  and tradingDate = dt
+                order by eventTime;
+
+        smDay = select *
+                from smallTrades
+                where securityCode = sec
+                  and tradingDate = dt
+                order by execTime;
+
+        if(size(evDay) == 0){
+            continue;
+        }
+
+        for(j in 0:(size(evDay)-1)){
+            thisTime = evDay.eventTime[j];
+            endTime  = thisTime + 30000;
+            bigVol   = double(evDay.bigVol[j]);
+
+            if(isNull(bigVol) || bigVol <= 0){
+                continue;
+            }
+
+            tmp = select sum(smallSellVol) as followSellVol
+                  from smDay
+                  where execTime > thisTime
+                    and execTime <= endTime;
+
+            ss = tmp.followSellVol[0];
+            if(isNull(ss)) ss = 0.0;
+            ss = double(ss);
+
+            ratio = ss / bigVol;
+
+            if(ratio >= thetaSell){
+                row = table(
+                    take(sec, 1) as securityCode,
+                    take(dt, 1) as tradingDate,
+                    take(thisTime, 1) as eventTime,
+                    take(bigVol, 1) as bigVol,
+                    take(ss, 1) as followSmallSellVol,
+                    take(ratio, 1) as smallSellRatio30s
+                );
+                result.append!(row);
+            }
+        }
+    }
+
+    return result;
+}
+
+
+// ================================================================
+// 第七部分：聚合成两个日频因子
+// QuietBigBuy30s
+// FollowedBigSell30s
+// ================================================================
+
+def QuietBigBuyAndFollowedBigSell_factor(tickOrder, smallPct=30, thetaBuy=0.05, thetaSell=0.05){
+    data = build_base_tick_data(tickOrder);
+
+    if(size(data) == 0){
+        return table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+    }
+
+    bigBuyEvents  = build_big_buy_events_from_base(data);
+    bigSellEvents = build_big_sell_events_from_base(data);
+    smallTrades   = build_small_trade_table_both(data, smallPct);
+
+    quietBigBuyEvents      = filter_quiet_big_buy_events(bigBuyEvents, smallTrades, thetaBuy);
+    followedBigSellEvents  = filter_followed_big_sell_events(bigSellEvents, smallTrades, thetaSell);
+
+    totalVol = select securityCode, tradingDate, sum(execVolume) as totalTradeVolume
+               from data
+               group by securityCode, tradingDate;
+
+    baseInfo = select first(marketType) as marketType, securityCode
+               from data
+               group by securityCode;
+
+    // ---------- QuietBigBuy30s ----------
+    if(size(quietBigBuyEvents) > 0){
+        buyAgg = select securityCode, tradingDate, sum(bigVol) as quietBigBuyVol
+                 from quietBigBuyEvents
+                 group by securityCode, tradingDate;
+
+        buyAgg = select buyAgg.securityCode, buyAgg.tradingDate,
+                        buyAgg.quietBigBuyVol, totalVol.totalTradeVolume, baseInfo.marketType
+                 from buyAgg
+                 left join totalVol
+                 on buyAgg.securityCode = totalVol.securityCode
+                    and buyAgg.tradingDate = totalVol.tradingDate
+                 left join baseInfo
+                 on buyAgg.securityCode = baseInfo.securityCode;
+
+        res1 = select case when marketType == 101 then securityCode + ".SH"
+                           else securityCode + ".SZ" end as securityid,
+                      tradingDate as tradetime,
+                      `QuietBigBuy30s as factorname,
+                      double(quietBigBuyVol) / double(totalTradeVolume) as value
+               from buyAgg
+               where totalTradeVolume > 0;
+    }
+    else{
+        res1 = table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+    }
+
+    // ---------- FollowedBigSell30s ----------
+    if(size(followedBigSellEvents) > 0){
+        sellAgg = select securityCode, tradingDate, sum(bigVol) as followedBigSellVol
+                  from followedBigSellEvents
+                  group by securityCode, tradingDate;
+
+        sellAgg = select sellAgg.securityCode, sellAgg.tradingDate,
+                         sellAgg.followedBigSellVol, totalVol.totalTradeVolume, baseInfo.marketType
+                  from sellAgg
+                  left join totalVol
+                  on sellAgg.securityCode = totalVol.securityCode
+                     and sellAgg.tradingDate = totalVol.tradingDate
+                  left join baseInfo
+                  on sellAgg.securityCode = baseInfo.securityCode;
+
+        res2 = select case when marketType == 101 then securityCode + ".SH"
+                           else securityCode + ".SZ" end as securityid,
+                      tradingDate as tradetime,
+                      `FollowedBigSell30s as factorname,
+                      double(followedBigSellVol) / double(totalTradeVolume) as value
+               from sellAgg
+               where totalTradeVolume > 0;
+    }
+    else{
+        res2 = table(1:0, `securityid`tradetime`factorname`value, [SYMBOL, DATE, SYMBOL, DOUBLE]);
+    }
+
+    resultTable = unionAll(res1, res2);
+    resultTable = select securityid, tradetime, factorname, value
+                  from resultTable
+                  order by tradetime, securityid, factorname;
+    return resultTable;
+}
+
+
+// ================================================================
+// 第八部分：任务执行框架
+// 可直接提交多日任务
+// ================================================================
+
+def factorjobExec_quiet_follow(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB]);
+    day = conf[`startday]..conf[`endday];
+
+    start1 = 09:30:00.000;
+    end1   = 11:30:00.000;
+    start2 = 13:00:00.000;
+    end2   = 15:00:00.000;
+
+    ds = sqlDS(<select securityCode, marketType, execTime, execVolume,
+                       bidApplSeqNum, offerApplSeqNum, side
+                from dataTB
+                where date(execTime) in day
+                  and ((time(execTime) between start1 and end1)
+                    or (time(execTime) between start2 and end2))>);
+
+    res = mr(ds, conf[`func]).unionAll();
+    res = select securityid, tradetime, factorname, value from res;
+
+    factorTB = loadTable(conf[`factorDB], conf[`factorTB]);
+    factorTB.append!(res);
+
+    print("写入完成, 记录数: " + string(size(res)));
+}
+
+
+// ================================================================
+// 第九部分：提交任务
+// ================================================================
+
+factorName = "QuietBigBuy30s_FollowedBigSell30s";
+factorFunc = defg(t){
+    return QuietBigBuyAndFollowedBigSell_factor(t, 30, 0.05, 0.05);
+};
+
+conf = {
+    funcsec   : NULL,
+    dataDB    : "dfs://HFDataDerivationa",
+    dataTB    : "tickExecutionDER",
+    factorDB  : "dfs://QuantFactorDay_Test",
+    factorTB  : "Intern_Factor_Test_ZKZ"
+    startday  : 2026.02.01,
+    endday    : 2026.02.27
+};
+
+conf[`func] = factorFunc;
+conf[`factorname] = factorName;
+
+print(">>> 提交 QuietBigBuy30s / FollowedBigSell30s 因子任务");
+submitJob("factor_job_QuietBigBuy30s_FollowedBigSell30s", factorName, factorjobExec_quiet_follow, conf);
+
+print("=== 因子任务已提交! ===");

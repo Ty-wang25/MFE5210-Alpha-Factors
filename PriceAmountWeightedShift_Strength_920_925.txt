@@ -1,0 +1,278 @@
+// ================================================================
+// 因子名称: PriceAmountWeightedShift_Strength_920_925
+//
+// 逻辑:
+//   earlyBuyVWAP = 09:20:00 - 09:24:00 买单 VWAP
+//   lateBuyVWAP  = 09:24:00 - 09:25:00 买单 VWAP
+//
+//   priceShift = (lateBuyVWAP - earlyBuyVWAP) / earlyBuyVWAP
+//   lateAmountRatio = lateBuyAmount / totalBuyAmount
+//
+//   value = priceShift * lateAmountRatio
+//
+// 写入表:
+//   dfs://QuantFactorDay_Test / Intern_Factor_Test_agreesive
+// ================================================================
+
+
+def emptyPriceAmountWeightedShiftStrengthTable(){
+    return table(
+        100:0,
+        `securityid`tradetime`factorname`value`rawSignal`earlyVWAP`lateVWAP`buyOrderCnt`buyAmount`lateAmountRatio,
+        [STRING, DATE, STRING, DOUBLE, DOUBLE, DOUBLE, DOUBLE, INT, DOUBLE, DOUBLE]
+    )
+}
+
+
+def winsorizeByDate_Strength(inputTbl, winsorK){
+    if(count(inputTbl) == 0){
+        return inputTbl
+    }
+
+    medTbl = select
+                tradetime,
+                median(value) as med
+             from inputTbl
+             group by tradetime
+
+    tmp = lj(inputTbl, medTbl, `tradetime)
+
+    tmp = select
+             securityid,
+             tradetime,
+             factorname,
+             value,
+             rawSignal,
+             earlyVWAP,
+             lateVWAP,
+             buyOrderCnt,
+             buyAmount,
+             lateAmountRatio,
+             med,
+             abs(value - med) as absDev
+          from tmp
+
+    madTbl = select
+                tradetime,
+                median(absDev) as madVal
+             from tmp
+             group by tradetime
+
+    joined = lj(tmp, madTbl, `tradetime)
+
+    return select
+              securityid,
+              tradetime,
+              factorname,
+              iif(
+                  isNull(value),
+                  NULL,
+                  iif(
+                      isNull(madVal) or madVal <= 0,
+                      value,
+                      iif(
+                          value > med + winsorK * madVal,
+                          med + winsorK * madVal,
+                          iif(
+                              value < med - winsorK * madVal,
+                              med - winsorK * madVal,
+                              value
+                          )
+                      )
+                  )
+              ) as value,
+              rawSignal,
+              earlyVWAP,
+              lateVWAP,
+              buyOrderCnt,
+              buyAmount,
+              lateAmountRatio
+           from joined
+}
+
+
+def PriceAmountWeightedShiftStrength920925(tickOrder){
+
+    minBuyOrderCnt = 1
+    minBuyAmount = 5.0
+    winsorK = 3.0
+    eps = 0.000001
+
+    raw = select
+            securityCode,
+            marketType,
+            double(orderPrice) as orderPrice,
+            double(orderVolume) as orderVolume,
+            double(orderPrice * orderVolume) as orderAmount,
+            time(orderTime) as orderTimeOnly,
+            date(orderTime) as tradetime
+          from tickOrder
+          where time(orderTime) between 09:20:00.000 : 09:25:00.000
+            and string(side) = "B"
+            and ((marketType == 101 and string(orderType) = "A") or (marketType != 101))
+            and orderPrice > 0
+            and orderVolume > 0
+
+    if(count(raw) == 0){
+        return emptyPriceAmountWeightedShiftStrengthTable()
+    }
+
+    earlyPart = select
+                  first(marketType) as marketType,
+                  sum(orderAmount) / sum(orderVolume) as earlyVWAP,
+                  count(*) as cntEarly,
+                  sum(orderAmount) as amtEarly
+                from raw
+                where orderTimeOnly between 09:20:00.000 : 09:24:00.000
+                group by securityCode, tradetime
+
+    latePart = select
+                 sum(orderAmount) / sum(orderVolume) as lateVWAP,
+                 count(*) as cntLate,
+                 sum(orderAmount) as amtLate
+               from raw
+               where orderTimeOnly between 09:24:00.000 : 09:25:00.000
+               group by securityCode, tradetime
+
+    if(count(earlyPart) == 0 or count(latePart) == 0){
+        return emptyPriceAmountWeightedShiftStrengthTable()
+    }
+
+    joined = ej(earlyPart, latePart, `securityCode`tradetime)
+
+    if(count(joined) == 0){
+        return emptyPriceAmountWeightedShiftStrengthTable()
+    }
+
+    res = select
+            iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+            tradetime,
+            "PriceAmountWeightedShift_Strength_920_925" as factorname,
+
+            double((lateVWAP - earlyVWAP) / iif(earlyVWAP > eps, earlyVWAP, eps)) as rawSignal,
+            earlyVWAP,
+            lateVWAP,
+            int(cntEarly + cntLate) as buyOrderCnt,
+            double(amtEarly + amtLate) as buyAmount,
+            double(amtLate / iif(amtEarly + amtLate > eps, amtEarly + amtLate, eps)) as lateAmountRatio,
+
+            iif(
+                int(cntEarly + cntLate) >= minBuyOrderCnt
+                and double(amtEarly + amtLate) >= minBuyAmount
+                and earlyVWAP > eps,
+                double(
+                    ((lateVWAP - earlyVWAP) / earlyVWAP) *
+                    (amtLate / iif(amtEarly + amtLate > eps, amtEarly + amtLate, eps))
+                ),
+                NULL
+            ) as value
+          from joined
+
+    res = select * from res where not isNull(value)
+
+    if(count(res) == 0){
+        return emptyPriceAmountWeightedShiftStrengthTable()
+    }
+
+    winsorRes = winsorizeByDate_Strength(res, winsorK)
+
+    finalRes = select
+                 securityid,
+                 tradetime,
+                 factorname,
+                 value,
+                 rawSignal,
+                 earlyVWAP,
+                 lateVWAP,
+                 buyOrderCnt,
+                 buyAmount,
+                 lateAmountRatio
+               from winsorRes
+               where not isNull(value)
+
+    return finalRes
+}
+
+
+def factorjobExec_PriceAmountWeightedShiftStrength(conf){
+
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    day = conf[`startday]..conf[`endday]
+
+    // 跳过已知损坏日期
+    day = day[day != 2026.02.06]
+
+    ds = sqlDS(<select * from dataTB where date(orderTime) in day>)
+
+    res = mr(ds, conf[`func], , unionAll)
+
+    if(count(res) > 0){
+
+        finalTable = select
+                        securityid,
+                        tradetime,
+                        factorname,
+                        double(value) as value,
+
+                        // 以下字段按 Intern_Factor_Test_agreesive 原字段复用
+                        double(rawSignal) as priceSlope,
+                        double(earlyVWAP) as corr_xy,
+                        int(buyOrderCnt) as buyOrderCnt,
+                        double(lateVWAP) as R2,
+                        double(buyAmount) as slopeTstat
+                     from res
+
+        factorTB = loadTable(conf[`factorDB], conf[`factorTB])
+        factorTB.append!(finalTable)
+
+        print("写入完成，数量: " + string(count(finalTable)))
+    }
+    else{
+        print("无有效结果")
+    }
+}
+
+
+def runPriceAmountWeightedShiftStrengthFactorJob(){
+
+    conf = {
+        func : PriceAmountWeightedShiftStrength920925,
+        dataDB : "dfs://HFDataFusion",
+        dataTB : "tickOrder",
+        factorDB : "dfs://QuantFactorDay_Test",
+        factorTB : "Intern_Factor_Test_agreesive",
+        startday : 2018.01.04,
+        endday : 2026.03.31
+    }
+
+    current_memory = mem().memoryAllocated
+    current_task = count(select * from getRecentJobs() where endTime is NULL)
+    mem_limit = 68719476736
+
+    if(current_task < 5 and current_memory < mem_limit){
+        print("资源充足，正在提交 Job...")
+
+        submitJob(
+            "PriceAmountWeightedShiftStrength920925Job",
+            "PriceAmountWeightedShift_Strength_920_925",
+            factorjobExec_PriceAmountWeightedShiftStrength,
+            conf
+        )
+    }
+    else{
+        msg = "资源繁忙，5分钟后重试。当前内存GB: " +
+              string(round(current_memory / 1024 / 1024 / 1024, 2)) +
+              ", 当前任务数: " +
+              string(current_task)
+
+        print(msg)
+
+        sleep(300000)
+        runPriceAmountWeightedShiftStrengthFactorJob()
+    }
+}
+
+
+runPriceAmountWeightedShiftStrengthFactorJob()
+
+
