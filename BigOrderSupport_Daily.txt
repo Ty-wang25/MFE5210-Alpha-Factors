@@ -1,0 +1,256 @@
+// ================================================================
+// BigOrderSupport_Daily
+// 逻辑：市场下跌日中，个股若出现“大单净买 + 相对抗跌”，则因子更高
+// 数据源：dfs://HFDataDerivation / tickExecutionDER
+// 结果表：dfs://QuantFactorDay_Test / Intern_Factor_Test_WTY
+// ================================================================
+
+
+// =========================
+// 1. 参数区
+// =========================
+factorName = `BigOrderSupport_Daily
+
+startDate = 2018.01.01
+endDate   = 2018.01.02
+
+// 市场下跌阈值：例如 -0.5%
+marketDropThreshold = -0.005
+
+// 大单阈值：个股-日期内，按单笔成交额 valueTrade 的分位数来定义
+bigTradeQuantile = 0.80
+
+// 绝对最小大单成交额门槛（防止小票分位数阈值太低）
+// 可按需要调大到 50000 / 100000 / 200000
+minBigTradeAmt = 100000.0
+
+
+// =========================
+// 2. 载入表
+// =========================
+dbTick   = database("dfs://HFDataDerivation")
+tickTb   = loadTable(dbTick, "tickExecutionDER")
+
+dbFactor = database("dfs://QuantFactorDay_Test")
+factorTb = loadTable(dbFactor, "Intern_Factor_Test_WTY")
+
+
+// =========================
+// 3. 读取连续竞价成交
+//    这里只保留：09:30-11:30, 13:00-15:00
+//    side 只保留 B / S
+// =========================
+raw = select
+        date(execTime) as tradetime,
+        securityCode   as securityid,
+        execTime,
+        double(execPrice)  as execPrice,
+        long(execVolume)   as execVolume,
+        double(valueTrade) as valueTrade,
+        side
+      from tickTb
+      where date(execTime) between startDate : endDate
+        and (
+              (time(execTime) >= 09:30:00.000 and time(execTime) <= 11:30:00.000)
+              or
+              (time(execTime) >= 13:00:00.000 and time(execTime) <= 15:00:00.000)
+            )
+        and execVolume > 0
+        and not isNull(execPrice)
+        and not isNull(securityCode)
+        and side in `B`S
+
+
+// =========================
+// 4. 计算个股日频基础信息
+//    收益率：last / first - 1
+// =========================
+dailyBase = select
+              tradetime,
+              securityid,
+              first(execPrice) as firstPx,
+              last(execPrice)  as lastPx,
+              sum(execVolume)  as totalVol,
+              sum(valueTrade)  as totalAmt,
+              count(*)         as tradeCnt
+            from raw
+            group by tradetime, securityid
+
+dailyBase = select
+              tradetime,
+              securityid,
+              firstPx,
+              lastPx,
+              totalVol,
+              totalAmt,
+              tradeCnt,
+              iif(firstPx > 0, lastPx / firstPx - 1.0, NULL) as stockRet
+            from dailyBase
+            where not isNull(firstPx) and not isNull(lastPx) and totalAmt > 0
+
+
+// =========================
+// 5. 计算市场收益（等权平均）
+//    你后续也可以改成市值加权 / 指数收益
+// =========================
+marketDaily = select
+                tradetime,
+                avg(stockRet) as marketRet
+              from dailyBase
+              where not isNull(stockRet)
+              group by tradetime
+
+
+// =========================
+// 6. 合并市场收益，得到抗跌强度
+//    resilience = stockRet - marketRet
+// =========================
+panel = lj(dailyBase, marketDaily, `tradetime)
+
+panel = select
+          tradetime,
+          securityid,
+          firstPx,
+          lastPx,
+          totalVol,
+          totalAmt,
+          tradeCnt,
+          stockRet,
+          marketRet,
+          stockRet - marketRet as resilience,
+          iif(marketRet <= marketDropThreshold, 1, 0) as isMarketDown
+        from panel
+
+
+// =========================
+// 7. 在“个股-日期”内计算大单阈值
+//    用 valueTrade 的分位数阈值定义大单
+// =========================
+rawWithLine = select
+                tradetime,
+                securityid,
+                execTime,
+                execPrice,
+                execVolume,
+                valueTrade,
+                side,
+                percentile(valueTrade, bigTradeQuantile) as pctLine
+              from raw
+              context by tradetime, securityid
+
+rawWithLine = select
+                tradetime,
+                securityid,
+                execTime,
+                execPrice,
+                execVolume,
+                valueTrade,
+                side,
+                iif(pctLine > minBigTradeAmt, pctLine, minBigTradeAmt) as bigAmtLine
+              from rawWithLine
+
+
+// =========================
+// 8. 聚合大单净买卖
+//    大单买入金额 / 大单卖出金额
+// =========================
+bigAgg = select
+           tradetime,
+           securityid,
+           sum(iif(side == `B and valueTrade >= bigAmtLine, valueTrade, 0.0)) as bigBuyAmt,
+           sum(iif(side == `S and valueTrade >= bigAmtLine, valueTrade, 0.0)) as bigSellAmt,
+           sum(iif(side == `B and valueTrade >= bigAmtLine, execVolume, 0))    as bigBuyVol,
+           sum(iif(side == `S and valueTrade >= bigAmtLine, execVolume, 0))    as bigSellVol,
+           sum(iif(valueTrade >= bigAmtLine, 1, 0))                         as bigTradeCnt
+         from rawWithLine
+         group by tradetime, securityid
+
+
+// =========================
+// 9. 合并回日频面板
+// =========================
+panel = lj(panel, bigAgg, `tradetime`securityid)
+
+panel = select
+          tradetime,
+          securityid,
+          totalVol,
+          totalAmt,
+          tradeCnt,
+          stockRet,
+          marketRet,
+          resilience,
+          isMarketDown,
+          iif(isNull(bigBuyAmt), 0.0, bigBuyAmt) as bigBuyAmt,
+          iif(isNull(bigSellAmt), 0.0, bigSellAmt) as bigSellAmt,
+          iif(isNull(bigBuyVol), 0, bigBuyVol) as bigBuyVol,
+          iif(isNull(bigSellVol), 0, bigSellVol) as bigSellVol,
+          iif(isNull(bigTradeCnt), 0, bigTradeCnt) as bigTradeCnt
+        from panel
+
+
+// =========================
+// 10. 构造因子
+//     netBigAmtRatio = (bigBuyAmt - bigSellAmt) / totalAmt
+//     factor = 仅在市场下跌日生效
+// =========================
+panel = select
+          tradetime,
+          securityid,
+          stockRet,
+          marketRet,
+          resilience,
+          isMarketDown,
+          bigBuyAmt,
+          bigSellAmt,
+          bigTradeCnt,
+          (bigBuyAmt - bigSellAmt) / totalAmt as netBigAmtRatio,
+          iif(isMarketDown = 1,
+              ((bigBuyAmt - bigSellAmt) / totalAmt) * resilience,
+              0.0
+          ) as factorValue
+        from panel
+        where not isNull(stockRet) and not isNull(marketRet) and totalAmt > 0
+
+
+// =========================
+// 11. 整理成目标表结构
+// =========================
+result = select
+           securityid,
+           tradetime,
+           factorName as factorname,
+           double(factorValue) as value
+         from panel
+
+
+// =========================
+// 12. 删除旧值后写入新值
+// =========================
+delete from factorTb
+where factorname = factorName
+  and tradetime between startDate : endDate
+
+append!(factorTb, result)
+
+
+// =========================
+// 13. 检查结果
+// =========================
+print("=== BigOrderSupport_Daily 已写入完成 ===")
+
+select top 20 *
+from factorTb
+where factorname = factorName
+order by tradetime, securityid
+
+select tradetime, count(*) as cnt
+from factorTb
+where factorname = factorName
+  and tradetime between startDate : endDate
+group by tradetime
+order by tradetime
+
+select min(tradetime) as firstDate, max(tradetime) as lastDate, count(*) as totalRows
+from factorTb
+where factorname = factorName

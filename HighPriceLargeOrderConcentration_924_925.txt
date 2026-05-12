@@ -1,0 +1,178 @@
+// ================================================================
+// 因子名称: HighPriceLargeOrderConcentration_924_925
+// 因子含义:
+// 1) 先在 09:20:00 - 09:25:00 的全部买单中，计算每只股票当日的：
+//    - 高价阈值：orderPrice 的 80% 分位数
+//    - 大单阈值：orderVolume 的 80% 分位数
+//
+// 2) 再在 09:24:00 - 09:25:00 最后一分钟中，统计：
+//    高价且大单的买单量 / 最后一分钟全部买单量
+//
+// 输出写入:
+// dfs://QuantFactorDay_Test / Intern_Factor_Test_WTY
+//
+// 输出字段:
+// securityid, tradetime, factorname, value
+// ================================================================
+
+
+
+// ================================================================
+// 1. 单日计算函数
+// ================================================================
+def calcHighPriceLargeOrderConcentrationOneDay(tradeDate){
+
+    orderTB = loadTable("dfs://HFDataFusion", "tickOrder")
+
+    // ------------------------------------------------------------
+    // Step 1: 提取 09:20:00 - 09:25:00 的全部买单
+    // ------------------------------------------------------------
+    raw = select
+            securityCode,
+            marketType,
+            double(orderPrice) as orderPrice,
+            double(orderVolume) as orderVolume,
+            time(orderTime) as orderTimeOnly
+          from orderTB
+          where date(orderTime) = tradeDate
+            and time(orderTime) between 09:20:00.000 : 09:25:00.000
+            and string(side) = "B"
+            and ((marketType == 101 and string(orderType) = "A") or (marketType != 101))
+            and orderPrice > 0
+            and orderVolume > 0
+
+    // 若当天无有效买单，返回空表
+    if(count(raw) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value,
+            [STRING, DATE, STRING, DOUBLE]
+        )
+    }
+
+    // ------------------------------------------------------------
+    // Step 2: 对每只股票计算全时段阈值
+    // - price80: 价格上 20% 阈值
+    // - volume80: 量上 20% 阈值
+    // ------------------------------------------------------------
+    threshold = select
+                  securityCode,
+                  first(marketType) as marketType,
+                  percentile(orderPrice, 80.0) as price80,
+                  percentile(orderVolume, 80.0) as volume80,
+                  count(*) as totalBuyOrderCnt
+                from raw
+                group by securityCode
+
+    // ------------------------------------------------------------
+    // Step 3: 取最后一分钟买单
+    // ------------------------------------------------------------
+    last1m = select
+               securityCode,
+               marketType,
+               orderPrice,
+               orderVolume
+             from raw
+             where orderTimeOnly between 09:24:00.000 : 09:25:00.000
+
+    if(count(last1m) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value,
+            [STRING, DATE, STRING, DOUBLE]
+        )
+    }
+
+    // ------------------------------------------------------------
+    // Step 4: 把阈值拼回最后一分钟数据
+    // ------------------------------------------------------------
+    joined = ej(last1m, threshold, `securityCode)
+
+    if(count(joined) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value,
+            [STRING, DATE, STRING, DOUBLE]
+        )
+    }
+
+    // ------------------------------------------------------------
+    // Step 5: 按股票汇总
+    // 分子: 最后一分钟中，高价且大单的买单量之和
+    // 分母: 最后一分钟全部买单量之和
+    // ------------------------------------------------------------
+    agg = select
+            securityCode,
+            first(marketType) as marketType,
+            sum(orderVolume) as totalLast1mBuyVol,
+            sum(iif(orderPrice >= price80 and orderVolume >= volume80, orderVolume, 0.0)) as highPriceLargeOrderVol,
+            count(*) as last1mOrderCnt
+          from joined
+          group by securityCode
+
+    // ------------------------------------------------------------
+    // Step 6: 生成标准因子表结构
+    // ------------------------------------------------------------
+    res = select
+            iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+            tradeDate as tradetime,
+            "HighPriceLargeOrderConcentration_924_925" as factorname,
+            iif(totalLast1mBuyVol > 0, highPriceLargeOrderVol * 1.0 / totalLast1mBuyVol, NULL) as value
+          from agg
+
+    return select * from res where not isNull(value)
+}
+
+
+
+// ================================================================
+// 2. 批量运行并写入目标因子表
+// ================================================================
+def runHighPriceLargeOrderConcentrationJob(startDate, endDate){
+
+    factorTB = loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_WTY")
+    totalWritten = 0
+    days = startDate..endDate
+
+    for(d in days){
+        ans = calcHighPriceLargeOrderConcentrationOneDay(d)
+
+        if(count(ans) > 0){
+            factorTB.append!(ans)
+            totalWritten = totalWritten + count(ans)
+            print(string(d) + " 写入完成, 条数: " + string(count(ans)))
+        }
+        else{
+            print(string(d) + " 无有效结果")
+        }
+    }
+
+    print("全部完成，总写入条数: " + string(totalWritten))
+}
+
+
+
+// ================================================================
+// 3. 启动运行
+// ================================================================
+// 你可以自行修改日期区间
+runHighPriceLargeOrderConcentrationJob(2018.01.01, 2018.01.10)
+
+
+
+// ================================================================
+// 4. 结果检查
+// ================================================================
+
+// 查看部分结果
+select top 20 *
+from loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_WTY")
+where factorname = "HighPriceLargeOrderConcentration_924_925"
+order by tradetime, securityid
+
+// 查看每天写入多少只股票
+select tradetime, count(*) as cnt
+from loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_WTY")
+where factorname = "HighPriceLargeOrderConcentration_924_925"
+group by tradetime
+order by tradetime

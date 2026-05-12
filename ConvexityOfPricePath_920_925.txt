@@ -1,0 +1,167 @@
+// ================================================================
+// 因子名称: ConvexityOfPricePath_920_925
+// 因子含义:
+// 在 09:20:00 - 09:25:00 集合竞价阶段，
+// 对买单价格 orderPrice 关于时间 t_sec 做二次回归：
+//      orderPrice = a + b*t + c*t^2
+// 取二次项系数 c 作为因子值。
+//
+// 解释：
+// c > 0 : 后段抬价加速
+// c < 0 : 前强后弱 / 后段减速
+//
+// 输出表:
+// dfs://QuantFactorDay_Test / Intern_Factor_Test_WTY
+// 字段:
+// securityid, tradetime, factorname, value
+// ================================================================
+
+
+
+// ================================================================
+// 1. 单日计算函数
+// ================================================================
+def calcConvexityOfPricePathOneDay(tradeDate){
+
+    orderTB = loadTable("dfs://HFDataFusion", "tickOrder")
+
+    // ------------------------------------------------------------
+    // Step 1: 取 09:20:00 - 09:25:00 买单
+    // ------------------------------------------------------------
+    raw = select
+            securityCode,
+            marketType,
+            double(orderPrice) as orderPrice,
+            (time(orderTime) - 09:20:00.000) / 1000.0 as t_sec
+          from orderTB
+          where date(orderTime) = tradeDate
+            and time(orderTime) between 09:20:00.000 : 09:25:00.000
+            and string(side) = "B"
+            and ((marketType == 101 and string(orderType) = "A") or (marketType != 101))
+            and orderPrice > 0
+
+    if(count(raw) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value,
+            [STRING, DATE, STRING, DOUBLE]
+        )
+    }
+
+    // ------------------------------------------------------------
+    // Step 2: 按股票聚合二次回归所需的各类求和项
+    //
+    // 正规方程:
+    // [ n    sumx   sumx2 ] [a]   [ sumy   ]
+    // [ sumx sumx2  sumx3 ] [b] = [ sumxy  ]
+    // [ sumx2 sumx3 sumx4 ] [c]   [ sumx2y ]
+    //
+    // 用 Cramer's Rule 显式求 c
+    // ------------------------------------------------------------
+    agg = select
+            securityCode,
+            first(marketType) as marketType,
+            count(*) as n,
+            sum(t_sec) as sx,
+            sum(t_sec * t_sec) as sx2,
+            sum(t_sec * t_sec * t_sec) as sx3,
+            sum(t_sec * t_sec * t_sec * t_sec) as sx4,
+            sum(orderPrice) as sy,
+            sum(t_sec * orderPrice) as sxy,
+            sum(t_sec * t_sec * orderPrice) as sx2y
+          from raw
+          group by securityCode
+
+    // ------------------------------------------------------------
+    // Step 3: 计算分子和分母
+    //
+    // c = numerator / denominator
+    //
+    // numerator =
+    //   - sx^2 * sx2y
+    //   + sx * sx2 * sxy
+    //   + sx * sx3 * sy
+    //   - sx2^2 * sy
+    //   + sx2 * sx2y * n
+    //   - sx3 * sxy * n
+    //
+    // denominator =
+    //   - sx^2 * sx4
+    //   + 2*sx*sx2*sx3
+    //   - sx2^3
+    //   + sx2*sx4*n
+    //   - sx3^2*n
+    // ------------------------------------------------------------
+    tmp = select
+            securityCode,
+            marketType,
+            n,
+            (
+                - sx * sx * sx2y
+                + sx * sx2 * sxy
+                + sx * sx3 * sy
+                - sx2 * sx2 * sy
+                + sx2 * sx2y * n
+                - sx3 * sxy * n
+            ) as numerator,
+            (
+                - sx * sx * sx4
+                + 2.0 * sx * sx2 * sx3
+                - sx2 * sx2 * sx2
+                + sx2 * sx4 * n
+                - sx3 * sx3 * n
+            ) as denominator
+          from agg
+
+    // ------------------------------------------------------------
+    // Step 4: 生成标准因子表
+    // 至少需要 3 个点才有意义；分母不能太接近 0
+    // ------------------------------------------------------------
+    res = select
+            iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+            tradeDate as tradetime,
+            "ConvexityOfPricePath_920_925" as factorname,
+            iif(n >= 3 and abs(denominator) > 1e-12, numerator / denominator, NULL) as value
+          from tmp
+
+    return select * from res where not isNull(value)
+}
+
+
+
+// ================================================================
+// 2. 批量运行并写入目标表
+// ================================================================
+def runConvexityOfPricePathJob(startDate, endDate){
+
+    factorTB = loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_WTY")
+    totalWritten = 0
+    days = startDate..endDate
+
+    for(d in days){
+        ans = calcConvexityOfPricePathOneDay(d)
+
+        if(count(ans) > 0){
+            factorTB.append!(ans)
+            totalWritten = totalWritten + count(ans)
+            print(string(d) + " 写入完成, 条数: " + string(count(ans)))
+        }
+        else{
+            print(string(d) + " 无有效结果")
+        }
+    }
+
+    print("全部完成，总写入条数: " + string(totalWritten))
+}
+
+
+
+// ================================================================
+// 3. 启动运行
+// ================================================================
+runConvexityOfPricePathJob(2019.01.01, 2026.03.31)
+
+
+
+
+

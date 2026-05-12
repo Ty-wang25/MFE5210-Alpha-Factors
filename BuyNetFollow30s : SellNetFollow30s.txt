@@ -1,0 +1,62 @@
+// ================================================================
+// 将 BuyNetFollow30s / SellNetFollow30s 直接写回因子库
+// ================================================================
+
+tb = loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_ZKZ");
+
+startDate = 2019.01.01;
+endDate   = 2026.02.17;
+
+
+// ---------- 买侧 ----------
+buyFollow = select securityid, tradetime, double(value) as buyFollow
+            from tb
+            where factorname = `SmallFollow30s_buy
+              and tradetime >= startDate
+              and tradetime <= endDate;
+
+buySmallSell = select securityid, tradetime, double(value) as buySmallSellFollow
+               from tb
+               where factorname = `BigBuy_SmallSellFollow30s
+                 and tradetime >= startDate
+                 and tradetime <= endDate;
+
+buyNet = select a.securityid, a.tradetime,
+                `BuyNetFollow30s as factorname,
+                double(a.buyFollow - b.buySmallSellFollow) as value
+         from buyFollow as a inner join buySmallSell as b
+         on a.securityid = b.securityid
+            and a.tradetime = b.tradetime;
+
+
+// ---------- 卖侧 ----------
+sellFollow = select securityid, tradetime, double(value) as sellFollow
+             from tb
+             where factorname = `SmallFollow30s_sell
+               and tradetime >= startDate
+               and tradetime <= endDate;
+
+sellSmallBuy = select securityid, tradetime, double(value) as sellSmallBuyFollow
+               from tb
+               where factorname = `BigSell_SmallBuyFollow30s
+                 and tradetime >= startDate
+                 and tradetime <= endDate;
+
+sellNet = select a.securityid, a.tradetime,
+                 `SellNetFollow30s as factorname,
+                 double(a.sellFollow - b.sellSmallBuyFollow) as value
+          from sellFollow as a inner join sellSmallBuy as b
+          on a.securityid = b.securityid
+             and a.tradetime = b.tradetime;
+
+
+// ---------- 合并 ----------
+result = unionAll(buyNet, sellNet);
+result = select securityid, tradetime, factorname, value
+         from result;
+
+
+// ---------- 写回 ----------
+tb.append!(result);
+
+print("写入完成, 新增记录数: " + string(size(result)));

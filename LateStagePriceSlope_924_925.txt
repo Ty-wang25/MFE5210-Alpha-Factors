@@ -1,0 +1,104 @@
+// ================================================================
+// 因子名称: LateStagePriceSlope_924_925
+// 含义:
+// 仅使用集合竞价最后一分钟（09:24:00 - 09:25:00）的买单，
+// 对委托价格 orderPrice 关于时间 t_sec 做线性回归，
+// 取回归斜率 slope = Cov(t, p) / Var(t) 作为因子值。
+// 
+// 输出表:
+// dfs://QuantFactorDay_Test / Intern_Factor_Test_WTY
+// 字段结构:
+// securityid (symbol), tradetime (date), factorname (symbol), value (double)
+// ================================================================
+
+
+
+// ================================================================
+// 1. 单日计算函数
+// ================================================================
+def calcLateStagePriceSlopeOneDay(tradeDate){
+
+    orderTB = loadTable("dfs://HFDataFusion", "tickOrder")
+
+    // ---------- 提取最后一分钟买单 ----------
+    raw = select
+            securityCode,
+            marketType,
+            double(orderPrice) as orderPrice,
+            (time(orderTime) - 09:24:00.000) / 1000.0 as t_sec
+          from orderTB
+          where date(orderTime) = tradeDate
+            and time(orderTime) between 09:24:00.000 : 09:25:00.000
+            and string(side) = "B"
+            and ((marketType == 101 and string(orderType) = "A") or (marketType != 101))
+            and orderPrice > 0
+
+    // ---------- 空结果返回空表 ----------
+    if(count(raw) == 0){
+        return table(
+            100:0,
+            `securityid`tradetime`factorname`value,
+            [STRING, DATE, STRING, DOUBLE]
+        )
+    }
+
+    // ---------- 分股票聚合 ----------
+    agg = select
+            securityCode,
+            first(marketType) as marketType,
+            covar(t_sec, orderPrice) as cov_tp,
+            var(t_sec) as var_t,
+            count(*) as orderCnt
+          from raw
+          group by securityCode
+
+    // ---------- 计算 slope ----------
+    res = select
+            iif(marketType == 101, string(securityCode) + ".SH", string(securityCode) + ".SZ") as securityid,
+            tradeDate as tradetime,
+            "LateStagePriceSlope_924_925" as factorname,
+            double(
+                iif(orderCnt >= 2 and abs(var_t) > 1e-12, cov_tp / var_t, NULL)
+            ) as value
+          from agg
+
+    return select * from res where not isNull(value)
+}
+
+
+
+// ================================================================
+// 2. 批量计算并写入因子表
+// ================================================================
+def runLateStagePriceSlopeJob(startDate, endDate){
+
+    factorTB = loadTable("dfs://QuantFactorDay_Test", "Intern_Factor_Test_WTY")
+    totalWritten = 0
+    days = startDate..endDate
+
+    for(d in days){
+        ans = calcLateStagePriceSlopeOneDay(d)
+
+        if(count(ans) > 0){
+            factorTB.append!(ans)
+            totalWritten = totalWritten + count(ans)
+            print(string(d) + " 写入完成, 条数: " + string(count(ans)))
+        }
+        else{
+            print(string(d) + " 无有效结果")
+        }
+    }
+
+    print("全部完成，总写入条数: " + string(totalWritten))
+}
+
+
+
+// ================================================================
+// 3. 启动运行
+// ================================================================
+// 你可以改成自己想跑的日期区间
+runLateStagePriceSlopeJob(2026.01.01, 2026.03.31)
+
+
+
